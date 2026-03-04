@@ -7,14 +7,40 @@ from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 
 
-def _patch_simple_imputer(obj):
-    """Fix SimpleImputer _fill_dtype compatibility for models trained with older scikit-learn."""
-    if isinstance(obj, SimpleImputer):
-        if not hasattr(obj, "_fill_dtype") and hasattr(obj, "statistics_"):
-            obj._fill_dtype = np.result_type(obj.statistics_.dtype, np.float64)
-    elif isinstance(obj, Pipeline):
+def _iter_estimators(obj, seen=None):
+    """Recursively yield all nested estimators (Pipeline, GridSearchCV, etc.)."""
+    seen = seen or set()
+    if id(obj) in seen:
+        return
+    seen.add(id(obj))
+    if isinstance(obj, Pipeline):
         for _, step in obj.steps:
-            _patch_simple_imputer(step)
+            yield step
+            yield from _iter_estimators(step, seen)
+    elif hasattr(obj, "best_estimator_"):
+        yield obj.best_estimator_
+        yield from _iter_estimators(obj.best_estimator_, seen)
+    elif hasattr(obj, "transformers_"):
+        for _, trans, _ in obj.transformers_:
+            if trans != "drop":
+                yield trans
+                yield from _iter_estimators(trans, seen)
+    elif hasattr(obj, "estimators_") and isinstance(obj.estimators_, (list, tuple)):
+        for est in obj.estimators_:
+            yield est
+            yield from _iter_estimators(est, seen)
+
+
+def _patch_simple_imputer(model):
+    """Fix SimpleImputer _fill_dtype/_fit_dtype for models from older scikit-learn."""
+    for obj in _iter_estimators(model):
+        if isinstance(obj, SimpleImputer):
+            if hasattr(obj, "statistics_"):
+                dt = np.result_type(obj.statistics_.dtype, np.float64)
+                if not hasattr(obj, "_fill_dtype"):
+                    obj._fill_dtype = dt
+                if not hasattr(obj, "_fit_dtype"):
+                    obj._fit_dtype = dt
 
 
 @st.cache_resource
@@ -38,9 +64,15 @@ This app uses a machine learning model trained on the classic heart disease data
 """
 )
 
-model = load_model()
+# Model file options: best_model.pkl + any other .pkl in app folder
+_app_dir = Path(__file__).parent if "__file__" in dir() else Path(".")
+_pkl_files = list(_app_dir.glob("*.pkl"))
+_choices = ["best_model.pkl"] + sorted([f.name for f in _pkl_files if f.name != "best_model.pkl"])
+_default_idx = _choices.index("k-NN.pkl") if "k-NN.pkl" in _choices else 0
 
 with st.sidebar:
+    model_file = st.selectbox("Model file", _choices, index=_default_idx)
+    model = load_model(model_file)
     st.header("Patient Features")
 
     age = st.slider("Age", min_value=20, max_value=90, value=50)
@@ -92,6 +124,7 @@ if model is not None and predict_btn:
         pred = int(model.predict(input_data)[0])
     except Exception as e:
         st.error(f"Error while making prediction: {e}")
+        st.info("Tip: Re-run the Heart_Disease_Classification notebook to retrain and save with current scikit-learn.")
         st.stop()
 
     st.subheader("Prediction")
